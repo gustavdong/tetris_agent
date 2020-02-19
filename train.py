@@ -46,9 +46,10 @@ for ep in range(max_ep):
         cx = cx.detach()
         hx = hx.detach()
 
+    print(cx)
 
     # print(state.unsqueeze(0).shape)
-    for steps in range(max_steps):
+    # for steps in range(max_steps):
         # env.render()
         # value, logit, (hx, cx) = model((state.unsqueeze(0),
         #                                     (hx, cx)))
