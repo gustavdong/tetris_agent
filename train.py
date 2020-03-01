@@ -15,131 +15,148 @@ from nes_py.wrappers import JoypadSpace
 from net import ActorCritic
 from utils import crop_image
 
+def ensure_shared_grads(model, shared_model):
+    for param, shared_param in zip(model.parameters(),
+                                   shared_model.parameters()):
+        if shared_param.grad is not None:
+            return
+        shared_param._grad = param.grad
 
-# def train()
+def train(rank, args, shared_model, counter, lock, optimizer=None):
 
-max_ep = 5000
-max_steps = 50000
-gamma = 0.99
-gae_lambda = 0.5
-entropy_coef = 0.01
-value_loss_coef = 0.5
-max_episode_length = 50000
-lr = 0.0004
-max_grad_norm = 40
+# max_ep = 5000
+# max_steps = 50000
+# gamma = 0.99
+# gae_lambda = 0.5
+# entropy_coef = 0.01
+# value_loss_coef = 0.5
+# max_episode_length = 50000
+# lr = 0.0004
+# max_grad_norm = 40
 
-env = gym_tetris.make('TetrisA-v3')
-env = JoypadSpace(env, MOVEMENT)
-env.seed(100)
+    env = gym_tetris.make('TetrisA-v1')
+    env = JoypadSpace(env, MOVEMENT)
+    env.seed(100 + rank)
 
-# print(env.action_space.n)
+    # print(env.action_space.n)
 
-model = ActorCritic(3, env.action_space)
-model.train()
+    model = ActorCritic(1, env.action_space)
+    model.train()
 
-highest_score = 0
+    # highest_score = 0
 
-optimizer = None
+    if optimizer is None:
+        optimizer = optim.Adam(model.parameters(), lr=args['lr'])
 
-if optimizer is None:
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-for ep in range(max_ep):
-    print(f'episode ---- {ep}')
     state = env.reset()
     state = crop_image(state)
-    state = torch.from_numpy(state.transpose((2, 0, 1)))
-    # print(state.shape)
-    done = True
+    # state = torch.from_numpy(state.transpose((2, 0, 1)))
+    state = torch.from_numpy(state)
 
-    values = []
-    log_probs = []
-    rewards = []
-    entropies = []
-
+    ep = 0 
     episode_length = 0
+
+    # for ep in range(max_ep):
     # while True:
-        # Sync with the shared model
-        # model.load_state_dict(shared_model.state_dict())
-    if done:
-        cx = torch.zeros(1, 256)
-        hx = torch.zeros(1, 256)
-    else:
-        cx = cx.detach() #remove a tensor from a computation graph
-        hx = hx.detach()
+    while ep <= args['max_ep']:
 
-    # print(state.unsqueeze(0).shape)
-    for steps in range(max_steps):
-        # env.render()
+        ## Synchronise with global model
+        model.load_state_dict(shared_model.state_dict())
+        ep += 1
+        # print(f'Localnet-{rank} episode ---- {ep}')
 
-        ## compute Qvalue, and gradient descend value
-        value, logit, (hx, cx) = model.forward((state.unsqueeze(0), (hx, cx)))
+        # print(state.shape)
+        done = True
 
-        ## derive probability for an action
-        prob = F.softmax(logit, dim=-1)
-        log_prob = F.log_softmax(logit, dim=-1)
-        entropy = -(log_prob * prob).sum(1, keepdim=True)
-        entropies.append(entropy)
+        values = []
+        log_probs = []
+        rewards = []
+        entropies = []
 
-        action = prob.multinomial(num_samples=1).detach()
-        log_prob = log_prob.gather(1, action)
-
-        state, reward, done, info = env.step(action.numpy()[0][0])
-
-        # print(steps,"---------",'reward:',reward, 'score:',info['score'], 'height:',info['board_height'])
-        done = done or episode_length >= max_episode_length
-        reward = max(min(reward, 1), -1)
-
+        # while True:
+            # Sync with the shared model
+            # model.load_state_dict(shared_model.state_dict())
         if done:
-            episode_length = 0
-            state = env.reset()
+            # cx = torch.zeros(1, 256)
+            # hx = torch.zeros(1, 256)
+            cx = torch.zeros(1, 128)
+            hx = torch.zeros(1, 128)
+        else:
+            cx = cx.detach() #remove a tensor from a computation graph
+            hx = hx.detach()
 
-        state = torch.from_numpy(crop_image(state).transpose((2, 0, 1)))
-        values.append(value)
-        log_probs.append(log_prob)
-        rewards.append(reward)
+        # print(state.unsqueeze(0).shape)
+        for steps in range(args['max_steps']):
+            # env.render()
 
-        if done:
-            break
+            # print(cx.shape, hx.shape)
+            ## compute Qvalue, and gradient descend value
+            value, logit, (hx, cx) = model.forward((state.unsqueeze(0).unsqueeze(0), (hx, cx)))
 
-    R = torch.zeros(1, 1)
-    if not done:
-        value, _, _ = model((state.unsqueeze(0), (hx, cx)))
-        R = value.detach()
+            ## derive probability for an action
+            prob = F.softmax(logit, dim=-1)
+            log_prob = F.log_softmax(logit, dim=-1)
+            entropy = -(log_prob * prob).sum(1, keepdim=True)
+            entropies.append(entropy)
 
-    values.append(R)
-    policy_loss = 0
-    value_loss = 0
-    gae = torch.zeros(1, 1)
-    for i in reversed(range(len(rewards))):
-        R = gamma * R + rewards[i]
-        advantage = R - values[i]
-        value_loss = value_loss + 0.5 * advantage.pow(2)
+            action = prob.multinomial(num_samples=1).detach()
+            log_prob = log_prob.gather(1, action)
 
-        ## Generalised Advantage Estimation
-        delta_t = rewards[i] + gamma * \
-            values[i + 1] - values[i]
-        gae = gae * gamma * gae_lambda + delta_t
+            state, reward, done, info = env.step(action.numpy()[0][0])
 
-        policy_loss = policy_loss - \
-            log_probs[i] * gae.detach() - entropy_coef * entropies[i]
+            # print(steps,"---------",'reward:',reward, 'score:',info['score'], 'height:',info['board_height'])
+            done = done or episode_length >= args['max_episode_length']
+            reward = max(min(reward, 1), -1)
 
-    optimizer.zero_grad()
+            if done:
+                episode_length = 0
+                state = env.reset()
 
-    (policy_loss + value_loss_coef * value_loss).backward()
-    # print((policy_loss + value_loss_coef * value_loss).detach())
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            # state = torch.from_numpy(crop_image(state).transpose((2, 0, 1)))
+            state = torch.from_numpy(crop_image(state))
 
-    # ensure_shared_grads(model, shared_model)
-    optimizer.step()
+            values.append(value)
+            log_probs.append(log_prob)
+            rewards.append(reward)
 
-    if info['score'] >= highest_score:
-        highest_score = info['score']
-        if ep >= 2500:
-            torch.save(model, f'./checkpoint_{ep}.pth')
+            if done:
+                break
 
-    print(f"episode {ep} score -- {info['score']}", ' | ' ,f'historical highest score -- {highest_score}')
+        R = torch.zeros(1, 1)
+        if not done:
+            value, _, _ = model((state.unsqueeze(0).unsqueeze(0), (hx, cx)))
+            R = value.detach()
 
+        values.append(R)
+        policy_loss = 0
+        value_loss = 0
+        gae = torch.zeros(1, 1)
+        for i in reversed(range(len(rewards))):
+            R = args['gamma'] * R + rewards[i]
+            advantage = R - values[i]
+            value_loss = value_loss + 0.5 * advantage.pow(2)
+
+            ## Generalised Advantage Estimation
+            delta_t = rewards[i] + args['gamma'] * \
+                values[i + 1] - values[i]
+            gae = gae * args['gamma'] * args['gae_lambda'] + delta_t
+
+            policy_loss = policy_loss - \
+                log_probs[i] * gae.detach() - args['entropy_coef'] * entropies[i]
+
+        optimizer.zero_grad()
+
+        (policy_loss + args['value_loss_coef'] * value_loss).backward()
+        # print((policy_loss + value_loss_coef * value_loss).detach())
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args["max_grad_norm"])
+
+        ensure_shared_grads(model, shared_model)
+        optimizer.step()
+
+        # print(f"episode {ep} score -- {info['score']}", ' | ' ,f'historical highest score -- {highest_score}')
+        
+        print(f"WorkerNet-{rank}: episode {ep} score -- {info['score']}", " | ", f"total reward: {sum(rewards)}", " | ", f"lines cleared: {info['number_of_lines']}" \
+            ," | ", f"episode lengths: {steps}" ," | ", f"loss: {float(policy_loss + args['value_loss_coef'] * value_loss)}" )
 
 ## TO DO:
     '''
